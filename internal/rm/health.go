@@ -21,6 +21,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"k8s.io/klog/v2"
@@ -59,6 +60,197 @@ func matchesMigEvent(deviceGI, deviceCI, eventGI, eventCI uint32) bool {
 	return giMatches && ciMatches
 }
 
+const eventSetWaitTimeoutMs = 5000
+
+// gpuToWatch is a parent GPU that should be registered with the shared event set.
+type gpuToWatch struct {
+	uuid   string
+	handle nvml.Device
+	mask   uint64
+	device *Device
+}
+
+// healthSub is one plugin's devices and the channel used to mark them unhealthy.
+type healthSub struct {
+	devices           Devices
+	parentToDeviceMap map[string][]*Device
+	deviceIDToGiMap   map[string]uint32
+	deviceIDToCiMap   map[string]uint32
+	xids              disabledXIDs
+	unhealthy         chan<- *Device
+	stop              <-chan any
+}
+
+func (s *healthSub) notify(d *Device) {
+	select {
+	case s.unhealthy <- d:
+	case <-s.stop:
+	}
+}
+
+// healthWatch owns the process-wide NVML event set and the single Wait loop.
+// Mixed MIG starts one plugin per profile; sharing one Wait avoids overlapping
+type healthWatch struct {
+	mu         sync.Mutex
+	eventMu    sync.Mutex
+	eventSet   nvml.EventSet
+	registered map[string]struct{}
+	subs       []*healthSub
+	running    bool
+}
+
+func newHealthWatch() *healthWatch {
+	return &healthWatch{
+		registered: make(map[string]struct{}),
+	}
+}
+
+func (w *healthWatch) subscribe(lib nvml.Interface, sub *healthSub, gpus []gpuToWatch) error {
+	w.mu.Lock()
+	if w.eventSet == nil {
+		eventSet, ret := lib.EventSetCreate()
+		if ret != nvml.SUCCESS {
+			w.mu.Unlock()
+			return fmt.Errorf("failed to create event set: %v", ret)
+		}
+		w.eventSet = eventSet
+	}
+	eventSet := w.eventSet
+	w.mu.Unlock()
+
+	for _, gpu := range gpus {
+		w.mu.Lock()
+		_, already := w.registered[gpu.uuid]
+		w.mu.Unlock()
+		if already {
+			continue
+		}
+
+		w.eventMu.Lock()
+		ret := gpu.handle.RegisterEvents(gpu.mask, eventSet)
+		w.eventMu.Unlock()
+		switch {
+		case ret == nvml.ERROR_NOT_SUPPORTED:
+			klog.Warningf("Device %v is too old to support healthchecking.", gpu.device.ID)
+		case ret != nvml.SUCCESS:
+			klog.Infof("Marking device %v as unhealthy: %v", gpu.device.ID, ret)
+			sub.notify(gpu.device)
+		default:
+			w.mu.Lock()
+			w.registered[gpu.uuid] = struct{}{}
+			w.mu.Unlock()
+		}
+	}
+
+	w.mu.Lock()
+	w.subs = append(w.subs, sub)
+	if !w.running {
+		w.running = true
+		go w.loop()
+	}
+	w.mu.Unlock()
+	return nil
+}
+
+func (w *healthWatch) unsubscribe(sub *healthSub) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	kept := w.subs[:0]
+	for _, s := range w.subs {
+		if s != sub {
+			kept = append(kept, s)
+		}
+	}
+	w.subs = kept
+}
+
+func (w *healthWatch) loop() {
+	for {
+		w.mu.Lock()
+		eventSet := w.eventSet
+		idle := len(w.subs) == 0
+		w.mu.Unlock()
+		if idle {
+			w.mu.Lock()
+			if len(w.subs) == 0 {
+				w.running = false
+				w.mu.Unlock()
+				return
+			}
+			eventSet = w.eventSet
+			w.mu.Unlock()
+		}
+
+		w.eventMu.Lock()
+		e, ret := eventSet.Wait(eventSetWaitTimeoutMs)
+		w.eventMu.Unlock()
+
+		w.mu.Lock()
+		subs := append([]*healthSub(nil), w.subs...)
+		w.mu.Unlock()
+		if len(subs) == 0 {
+			continue
+		}
+
+		if ret == nvml.ERROR_TIMEOUT {
+			continue
+		}
+		if ret != nvml.SUCCESS {
+			klog.Infof("Error waiting for event: %v; Marking all devices as unhealthy", ret)
+			for _, s := range subs {
+				for _, d := range s.devices {
+					s.notify(d)
+				}
+			}
+			continue
+		}
+
+		for _, s := range subs {
+			s.handleEvent(e)
+		}
+	}
+}
+
+func (s *healthSub) handleEvent(e nvml.EventData) {
+	if e.EventType != nvml.EventTypeXidCriticalError {
+		klog.Infof("Skipping non-nvmlEventTypeXidCriticalError event: %+v", e)
+		return
+	}
+	if s.xids.IsDisabled(e.EventData) {
+		klog.Infof("Skipping event %+v", e)
+		return
+	}
+
+	klog.Infof("Processing event %+v", e)
+	eventUUID, ret := e.Device.GetUUID()
+	if ret != nvml.SUCCESS {
+		klog.Infof("Failed to determine uuid for event %v: %v; Marking all devices as unhealthy.", e, ret)
+		for _, d := range s.devices {
+			s.notify(d)
+		}
+		return
+	}
+
+	ds, exists := s.parentToDeviceMap[eventUUID]
+	if !exists {
+		return
+	}
+
+	for _, d := range ds {
+		if d.IsMigDevice() {
+			gi := s.deviceIDToGiMap[d.ID]
+			ci := s.deviceIDToCiMap[d.ID]
+			if !matchesMigEvent(gi, ci, e.GpuInstanceId, e.ComputeInstanceId) {
+				continue
+			}
+			klog.Infof("Event for mig device %v (gi=%v, ci=%v)", d.ID, gi, ci)
+		}
+
+		klog.Infof("XidCriticalError: Xid=%d on Device=%s; marking device as unhealthy.", e.EventData, d.ID)
+		s.notify(d)
+	}
+}
+
 // CheckHealth performs health checks on a set of devices, writing to the 'unhealthy' channel with any unhealthy devices
 func (r *nvmlResourceManager) checkHealth(stop <-chan any, devices Devices, unhealthy chan<- *Device) error {
 	xids := getDisabledHealthCheckXids()
@@ -82,17 +274,10 @@ func (r *nvmlResourceManager) checkHealth(stop <-chan any, devices Devices, unhe
 
 	klog.Infof("Ignoring the following XIDs for health checks: %v", xids)
 
-	eventSet, ret := r.nvml.EventSetCreate()
-	if ret != nvml.SUCCESS {
-		return fmt.Errorf("failed to create event set: %v", ret)
-	}
-	defer func() {
-		_ = eventSet.Free()
-	}()
-
 	placedDevices := make([]placedDevice, 0, len(devices))
 	deviceIDToGiMap := make(map[string]uint32)
 	deviceIDToCiMap := make(map[string]uint32)
+	gpus := make([]gpuToWatch, 0, len(devices))
 
 	eventMask := uint64(nvml.EventTypeXidCriticalError | nvml.EventTypeDoubleBitEccError | nvml.EventTypeSingleBitEccError)
 	for _, d := range devices {
@@ -120,77 +305,34 @@ func (r *nvmlResourceManager) checkHealth(stop <-chan any, devices Devices, unhe
 			continue
 		}
 
-		ret = gpu.RegisterEvents(eventMask&supportedEvents, eventSet)
-		switch {
-		case ret == nvml.ERROR_NOT_SUPPORTED:
-			klog.Warningf("Device %v is too old to support healthchecking.", d.ID)
-		case ret != nvml.SUCCESS:
-			klog.Infof("Marking device %v as unhealthy: %v", d.ID, ret)
-			unhealthy <- d
-		}
+		gpus = append(gpus, gpuToWatch{
+			uuid:   uuid,
+			handle: gpu,
+			mask:   eventMask & supportedEvents,
+			device: d,
+		})
 	}
-	parentToDeviceMap := groupByParent(placedDevices)
 
-	for {
-		select {
-		case <-stop:
-			return nil
-		default:
-		}
-
-		e, ret := eventSet.Wait(5000)
-		if ret == nvml.ERROR_TIMEOUT {
-			continue
-		}
-		if ret != nvml.SUCCESS {
-			klog.Infof("Error waiting for event: %v; Marking all devices as unhealthy", ret)
-			for _, d := range devices {
-				unhealthy <- d
-			}
-			continue
-		}
-
-		if e.EventType != nvml.EventTypeXidCriticalError {
-			klog.Infof("Skipping non-nvmlEventTypeXidCriticalError event: %+v", e)
-			continue
-		}
-
-		if xids.IsDisabled(e.EventData) {
-			klog.Infof("Skipping event %+v", e)
-			continue
-		}
-
-		klog.Infof("Processing event %+v", e)
-		eventUUID, ret := e.Device.GetUUID()
-		if ret != nvml.SUCCESS {
-			// If we cannot reliably determine the device UUID, we mark all devices as unhealthy.
-			klog.Infof("Failed to determine uuid for event %v: %v; Marking all devices as unhealthy.", e, ret)
-			for _, d := range devices {
-				unhealthy <- d
-			}
-			continue
-		}
-
-		ds, exists := parentToDeviceMap[eventUUID]
-		if !exists {
-			klog.Infof("Ignoring event for unexpected device: %v", eventUUID)
-			continue
-		}
-
-		for _, d := range ds {
-			if d.IsMigDevice() {
-				gi := deviceIDToGiMap[d.ID]
-				ci := deviceIDToCiMap[d.ID]
-				if !matchesMigEvent(gi, ci, e.GpuInstanceId, e.ComputeInstanceId) {
-					continue
-				}
-				klog.Infof("Event for mig device %v (gi=%v, ci=%v)", d.ID, gi, ci)
-			}
-
-			klog.Infof("XidCriticalError: Xid=%d on Device=%s; marking device as unhealthy.", e.EventData, d.ID)
-			unhealthy <- d
-		}
+	watch := r.watch
+	if watch == nil {
+		watch = newHealthWatch()
 	}
+	sub := &healthSub{
+		devices:           devices,
+		parentToDeviceMap: groupByParent(placedDevices),
+		deviceIDToGiMap:   deviceIDToGiMap,
+		deviceIDToCiMap:   deviceIDToCiMap,
+		xids:              xids,
+		unhealthy:         unhealthy,
+		stop:              stop,
+	}
+	if err := watch.subscribe(r.nvml, sub, gpus); err != nil {
+		return err
+	}
+	defer watch.unsubscribe(sub)
+
+	<-stop
+	return nil
 }
 
 const allXIDs = 0
